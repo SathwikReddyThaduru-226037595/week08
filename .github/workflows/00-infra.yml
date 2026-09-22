@@ -1,0 +1,131 @@
+name: 00 - Infrastructure (Terraform)
+
+# Infrastructure as Code stage.
+#
+# Plan runs automatically whenever the Terraform configuration changes, so that
+# every infrastructure change is validated before it is merged. Apply and
+# destroy are deliberately manual and require a typed confirmation, so the
+# pipeline can never create or delete billable Azure resources on its own.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/00-infra.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+      confirm:
+        description: "Type APPLY or DESTROY to confirm a state-changing run"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform ${{ inputs.action || 'plan' }}
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    env:
+      ARM_ACCESS_KEY: ${{ secrets.ARM_ACCESS_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Export service principal credentials for Terraform
+        env:
+          CREDS: ${{ secrets.AZURE_CREDENTIALS }}
+        run: |
+          CLIENT_ID=$(jq -r .clientId <<< "$CREDS")
+          CLIENT_SECRET=$(jq -r .clientSecret <<< "$CREDS")
+          TENANT_ID=$(jq -r .tenantId <<< "$CREDS")
+          SUBSCRIPTION_ID=$(jq -r .subscriptionId <<< "$CREDS")
+
+          echo "::add-mask::$CLIENT_ID"
+          echo "::add-mask::$CLIENT_SECRET"
+          echo "::add-mask::$TENANT_ID"
+          echo "::add-mask::$SUBSCRIPTION_ID"
+
+          {
+            echo "ARM_CLIENT_ID=$CLIENT_ID"
+            echo "ARM_CLIENT_SECRET=$CLIENT_SECRET"
+            echo "ARM_TENANT_ID=$TENANT_ID"
+            echo "ARM_SUBSCRIPTION_ID=$SUBSCRIPTION_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        if: inputs.action != 'destroy'
+        run: |
+          terraform plan -input=false -no-color \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID" \
+            -out=tfplan
+
+      - name: Terraform apply
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply' && inputs.confirm == 'APPLY'
+        run: terraform apply -input=false -no-color -auto-approve tfplan
+
+      - name: Terraform destroy
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy' && inputs.confirm == 'DESTROY'
+        run: |
+          terraform destroy -input=false -no-color -auto-approve \
+            -var="subscription_id=$ARM_SUBSCRIPTION_ID"
+
+      - name: Publish infrastructure outputs
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply' && inputs.confirm == 'APPLY'
+        run: |
+          {
+            echo "## Terraform outputs"
+            echo ""
+            echo "Set these as GitHub repository variables:"
+            echo ""
+            echo '| Variable | Value |'
+            echo '| --- | --- |'
+            echo "| ACR_NAME | \`$(terraform output -raw ACR_NAME)\` |"
+            echo "| ACR_LOGIN_SERVER | \`$(terraform output -raw ACR_LOGIN_SERVER)\` |"
+            echo "| AKS_RESOURCE_GROUP | \`$(terraform output -raw AKS_RESOURCE_GROUP)\` |"
+            echo "| AKS_CLUSTER_NAME | \`$(terraform output -raw AKS_CLUSTER_NAME)\` |"
+            echo ""
+            echo "The storage connection string is marked sensitive and is not printed here."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirmation missing
+        if: github.event_name == 'workflow_dispatch' && inputs.action != 'plan' && inputs.confirm != 'APPLY' && inputs.confirm != 'DESTROY'
+        run: |
+          echo "::error::Action '${{ inputs.action }}' requires confirm to be APPLY or DESTROY. Nothing was changed."
+          exit 1
